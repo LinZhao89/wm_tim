@@ -1,287 +1,305 @@
-# Towards Total Recall in Industrial Anomaly Detection
+# Geometry-Aware Wafer Map Anomaly Detection
 
-This repository contains the implementation for `PatchCore` as proposed in Roth et al. (2021), <https://arxiv.org/abs/2106.08265>.
+This repository is adapted from PatchCore for wafer map anomaly detection and localization.
+The current codebase focuses on **detection and localization only**. The archived anomaly classification path, Frequency and Channel Attention (FCA), and randomly initialized CBAM execution are not part of the current main experiment path.
 
-It also provides various pretrained models that can achieve up to _99.6%_ image-level anomaly
-detection AUROC, _98.4%_ pixel-level anomaly localization AUROC and _>95%_ PRO score (although the
-later metric is not included for license reasons).
+The main research path is:
 
-![defect_segmentation](images/patchcore_defect_segmentation.png)
+1. original PatchCore baseline;
+2. foreground-aware wafer preprocessing;
+3. polar geometry-aware patch metadata;
+4. geometry-balanced memory-bank sampling;
+5. neighboring-bin nearest-neighbor matching;
+6. optional mask-pretrained CBAM and embedding adapter;
+7. controlled localization evaluation with paired synthetic images and masks.
 
-_For questions & feedback, please reach out to karsten.rh1@gmail.com!_
+The repository still keeps the original PatchCore implementation as a baseline. The wafer-specific contribution is implemented through the geometry-aware PatchCore path and the synthetic-mask-assisted localization evaluation path.
 
 ---
 
-## Quick Guide
+## Environment
 
-First, clone this repository and set the `PYTHONPATH` environment variable with `env PYTHONPATH=src python bin/run_patchcore.py`.
-To train PatchCore on MVTec AD (as described below), run
+Install the requirements and expose the source folder:
 
-```
-datapath=/path_to_mvtec_folder/mvtec datasets=('bottle' 'cable' 'capsule' 'carpet' 'grid' 'hazelnut'
-'leather' 'metal_nut' 'pill' 'screw' 'tile' 'toothbrush' 'transistor' 'wood' 'zipper')
-dataset_flags=($(for dataset in "${datasets[@]}"; do echo '-d '$dataset; done))
-
-
-python bin/run_patchcore.py --gpu 0 --seed 0 --save_patchcore_model \
---log_group IM224_WR50_L2-3_P01_D1024-1024_PS-3_AN-1_S0 --log_online --log_project MVTecAD_Results results \
-patch_core -b wideresnet50 -le layer2 -le layer3 --faiss_on_gpu \
---pretrain_embed_dimension 1024  --target_embed_dimension 1024 --anomaly_scorer_num_nn 1 --patchsize 3 \
-sampler -p 0.1 approx_greedy_coreset dataset --resize 256 --imagesize 224 "${dataset_flags[@]}" mvtec $datapath
+```bash
+pip install -r requirements.txt
+export PYTHONPATH=src
 ```
 
-which runs PatchCore on MVTec images of sizes 224x224 using a WideResNet50-backbone pretrained on
-ImageNet. For other sample runs with different backbones, larger images or ensembles, see
-`sample_training.sh`.
+On Windows PowerShell:
 
-Given a pretrained PatchCore model (or models for all MVTec AD subdatasets), these can be evaluated using
-
-```shell
-datapath=/path_to_mvtec_folder/mvtec
-loadpath=/path_to_pretrained_patchcores_models
-modelfolder=IM224_WR50_L2-3_P001_D1024-1024_PS-3_AN-1_S0
-savefolder=evaluated_results'/'$modelfolder
-
-datasets=('bottle'  'cable'  'capsule'  'carpet'  'grid'  'hazelnut' 'leather'  'metal_nut'  'pill' 'screw' 'tile' 'toothbrush' 'transistor' 'wood' 'zipper')
-dataset_flags=($(for dataset in "${datasets[@]}"; do echo '-d '$dataset; done))
-model_flags=($(for dataset in "${datasets[@]}"; do echo '-p '$loadpath'/'$modelfolder'/models/mvtec_'$dataset; done))
-
-python bin/load_and_evaluate_patchcore.py --gpu 0 --seed 0 $savefolder \
-patch_core_loader "${model_flags[@]}" --faiss_on_gpu \
-dataset --resize 366 --imagesize 320 "${dataset_flags[@]}" mvtec $datapath
+```powershell
+$env:PYTHONPATH='src'
 ```
 
-A set of pretrained PatchCores are hosted here: __add link__. To use them (and replicate training),
-check out `sample_evaluation.sh` and `sample_training.sh`.
+The original experiments were developed with PyTorch, torchvision, FAISS, scikit-image, scikit-learn, scipy, pillow, tqdm, and click. See `requirements.txt` for the package list.
 
-### New CLI flags (added)
+---
 
-This repository has a few newer CLI flags to help with noisy datasets and per-image exports.
+## Expected WM811K layout
 
-- `--save_image_scores` (global flag): when set, the run writes per-dataset CSV files with columns `image,image_score_mean` into the run folder. Use together with `--image_scores_path` to override the output path.
-- `--image_scores_path <path>`: optional path to write the per-image CSV. If omitted, files are written into the run results folder as `image_scores_<dataset>.csv`.
-- Sampler additions (use the `sampler` chained command):
-      - `seeded_random` sampler — deterministic random sampling. Example: `sampler -p 0.01 --seed 42 seeded_random`.
-      - `approx_greedy_coreset` supports `--num_starting_points <int>` to tune the approximate coreset algorithm.
-- Frequency & Channel Attention (FCA): enableable per-run with `--use_fca` (patch_core). You can tune its internal sizes with `--fca_reduction <int>` and `--fca_freq_channels <int>`.
+The WM811K data should be prepared into an MVTec-like folder layout. A typical layout is:
 
-Example (bash):
-
+```text
+wm811k/
+  prepare_dataset_train_ratio10p/
+    train/
+      good/
+        *.png
+    test/
+      good/
+        *.png
+      Center/
+        *.png
+      Donut/
+        *.png
+      Edge-Loc/
+        *.png
+      Edge-Ring/
+        *.png
+      Loc/
+        *.png
+      Near-full/
+        *.png
+      Random/
+        *.png
+      Scratch/
+        *.png
+    ground_truth/
+      Center/
+        *_mask.png
+      Donut/
+        *_mask.png
+      ...
 ```
+
+When using the command-line interface, the dataset root is passed as `/path/to/wm811k`, and the prepared split folder is passed through `-d prepare_dataset_train_ratio10p`.
+
+---
+
+## Baseline PatchCore run
+
+The following command runs the original PatchCore baseline on the prepared WM811K split:
+
+```bash
 PYTHONPATH=src python bin/run_patchcore.py \
-      --gpu 0 --seed 0 --save_patchcore_model --save_image_scores --image_scores_path /tmp/image_scores.csv \
-      --log_group fasternet_model --log_project wm811k_cmean_im256_test0p results \
-      patch_core -b wideresnet50 -le layer2 -le layer3 --pretrain_embed_dimension 1024 --target_embed_dimension 1024 --anomaly_scorer_num_nn 1 --patchsize 3 --use_fca --fca_reduction 16 --fca_freq_channels 16 \
-      sampler -p 0.01 --seed 42 seeded_random \
-      dataset --resize 128 --imagesize 128 --subdatasets prepare_dataset_train_ratio10p wm811k /path/to/wm811k
+  --gpu 0 --seed 0 --save_patchcore_model --save_image_scores \
+  --log_group wm811k_patchcore_baseline --log_project wm811k results \
+  patch_core \
+  -b wideresnet50 -le layer2 -le layer3 \
+  --pretrain_embed_dimension 1024 \
+  --target_embed_dimension 1024 \
+  --anomaly_scorer_num_nn 1 \
+  --patchsize 3 \
+  sampler -p 0.01 --seed 0 seeded_random \
+  dataset \
+  --resize 128 --imagesize 128 \
+  --subdatasets prepare_dataset_train_ratio10p \
+  wm811k /path/to/wm811k
 ```
 
-### Inspecting WM811K images after constrained-mean filtering
-
-When debugging WM811K misclassifications it is often helpful to look at the wafermaps after the
-constrained-mean filter runs. The helper script `bin/export_filtered_wm811k.py` walks the training
-and/or test splits, applies the exact same filter as the datasets, optionally resizes/crops the
-images to the training resolution and writes the results to disk using the original directory
-structure.
-
-Example (PowerShell):
-
-```
-$env:PYTHONPATH='src'; python .\bin\export_filtered_wm811k.py `
-      dataset/wm811k prepare_dataset_train_ratio10p exports/filtered `
-      --split train --split test --imagesize 128 --resize 128
-```
-
-The command above creates `exports/filtered/prepare_dataset_train_ratio10p/<split>/<class>/...`
-folders containing the filtered PNGs. Use `--filter-window-size` / `--filter-threshold` to experiment
-with different filter settings, `--limit-per-class` to cap the number of exports, and
-`--keep-original-size` if you want to inspect the raw filtered resolution instead of the
-PatchCore-ready crops.
-
-### Anomaly classification metrics
-
-When running `bin/classify_anomalies.py` (or `bin/run_patchcore.py --classify_anomalies`) you can now produce post-classification metrics such as
-accuracy, macro precision/recall/F1, per-class scores, and a confusion matrix. Provide the new
-`--metrics_path` flag to save the report as JSON (it is also printed to the console):
-
-```
-PYTHONPATH=src python bin/classify_anomalies.py \
-      dataset/wm811k/prepare_dataset_train_ratio10p \
-      --scores_csv results/run/image_scores.csv \
-      --classifier_weights checkpoints/anom_cls.pth \
-      --save_csv results/run/anomaly_classifications.csv \
-      --threshold 0.5 \
-      --metrics_path results/run/anomaly_class_metrics.json
-```
-
-Ground-truth labels are inferred from the dataset folder names (e.g., `test/Donut/...`). The script
-logs accuracy and macro metrics plus a per-class breakdown; the optional JSON file mirrors the same
-information along with the confusion matrix for downstream analysis. In the end-to-end runner, pass
-`--classification_metrics_path /path/to/dir` to control where the JSON lands (defaults to the run
-folder if omitted) and optionally `--classification_report_csv` to dump a CSV version of the
-per-class stats.
-
-> **Tip:** `run_patchcore.py` now inherits the dataset resize/crop settings for the classification
-> stage automatically. If your classifier was trained on 128×128 wafers (by passing `--resize 128
-> --imagesize 128` to `train_anomaly_classifier.py`), you no longer have to repeat those numbers via
-> `--classification_resize` / `--classification_imagesize`—they default to the dataset’s values to
-> prevent mismatched preprocessing.
-
+The command saves image-level scores when `--save_image_scores` is enabled. By default, the score file is written under the run folder as `image_scores_<dataset>.csv`.
 
 ---
 
-## In-Depth Description
+## Geometry-aware PatchCore run
 
-### Requirements
+The geometry-aware path adds wafer foreground estimation, polar patch bins, geometry-balanced memory-bank sampling, and neighboring-bin nearest-neighbor search.
 
-Our results were computed using Python 3.8, with packages and respective version noted in
-`requirements.txt`. In general, the majority of experiments should not exceed 11GB of GPU memory;
-however using significantly large input images will incur higher memory cost.
-
-### Setting up MVTec AD
-
-To set up the main MVTec AD benchmark, download it from here: <https://www.mvtec.com/company/research/datasets/mvtec-ad>.
-Place it in some location `datapath`. Make sure that it follows the following data tree:
-
-```shell
-mvtec
-|-- bottle
-|-----|----- ground_truth
-|-----|----- test
-|-----|--------|------ good
-|-----|--------|------ broken_large
-|-----|--------|------ ...
-|-----|----- train
-|-----|--------|------ good
-|-- cable
-|-- ...
+```bash
+PYTHONPATH=src python bin/run_patchcore.py \
+  --gpu 0 --seed 0 --save_patchcore_model --save_image_scores \
+  --log_group wm811k_geometry_patchcore --log_project wm811k results \
+  patch_core \
+  -b wideresnet50 -le layer2 -le layer3 \
+  --pretrain_embed_dimension 1024 \
+  --target_embed_dimension 1024 \
+  --anomaly_scorer_num_nn 1 \
+  --patchsize 3 \
+  --use_geometry \
+  --radial_bins 4 \
+  --angular_bins 8 \
+  --min_wafer_coverage 0.5 \
+  --geometry_radial_neighbors 1 \
+  --geometry_angular_neighbors 1 \
+  sampler -p 0.1 --seed 0 geometry_coreset \
+  dataset \
+  --resize 128 --imagesize 128 \
+  --transform_mode resize_pad \
+  --subdatasets prepare_dataset_train_ratio10p \
+  wm811k /path/to/wm811k
 ```
 
-containing in total 15 subdatasets: `bottle`, `cable`, `capsule`, `carpet`, `grid`, `hazelnut`,
-`leather`, `metal_nut`, `pill`, `screw`, `tile`, `toothbrush`, `transistor`, `wood`, `zipper`.
+For geometry-aware PatchCore, use `geometry_coreset`. The geometry path requires this sampler because each selected memory-bank patch must keep its polar-bin metadata.
 
-### "Training" PatchCore
+---
 
-PatchCore extracts a (coreset-subsampled) memory of pretrained, locally aggregated training patch features:
+## Optional mask-pretrained modules
 
-![patchcore_architecture](images/architecture.png)
+The geometry-aware path can optionally load a mask-pretrained CBAM checkpoint and an embedding adapter:
 
-To do so, we have provided `bin/run_patchcore.py`, which uses `click` to manage and aggregate input
-arguments. This looks something like
-
-```shell
-python bin/run_patchcore.py \
---gpu <gpu_id> --seed <seed> # Set GPU-id & reproducibility seed.
---save_patchcore_model # If set, saves the patchcore model(s).
---log_online # If set, logs results to a Weights & Biases account.
---log_group IM224_WR50_L2-3_P01_D1024-1024_PS-3_AN-1_S0 --log_project MVTecAD_Results results # Logging details: Name of the run & Name of the overall project folder.
-
-patch_core  # We now pass all PatchCore-related parameters.
--b wideresnet50  # Which backbone to use.
--le layer2 -le layer3 # Which layers to extract features from.
---faiss_on_gpu # If similarity-searches should be performed on GPU.
---pretrain_embed_dimension 1024  --target_embed_dimension 1024 # Dimensionality of features extracted from backbone layer(s) and final aggregated PatchCore Dimensionality
---anomaly_scorer_num_nn 1 --patchsize 3 # Num. nearest neighbours to use for anomaly detection & neighbourhoodsize for local aggregation.
-
-sampler # We now pass all the (Coreset-)subsampling parameters.
--p 0.1 approx_greedy_coreset # Subsampling percentage & exact subsampling method.
-
-dataset # We now pass all the Dataset-relevant parameters.
---resize 256 --imagesize 224 "${dataset_flags[@]}" mvtec $datapath # Initial resizing shape and final imagesize (centercropped) as well as the MVTec subdatasets to use.
+```bash
+PYTHONPATH=src python bin/run_patchcore.py \
+  --gpu 0 --seed 0 --save_patchcore_model --save_image_scores \
+  --log_group wm811k_geometry_cbam_adapter --log_project wm811k results \
+  patch_core \
+  -b wideresnet50 -le layer2 -le layer3 \
+  --pretrain_embed_dimension 1024 \
+  --target_embed_dimension 1024 \
+  --anomaly_scorer_num_nn 1 \
+  --patchsize 3 \
+  --use_geometry \
+  --cbam_checkpoint checkpoints/mask_cbam.pth \
+  --embedding_adapter_path checkpoints/embedding_adapter.pth \
+  sampler -p 0.1 --seed 0 geometry_coreset \
+  dataset \
+  --resize 128 --imagesize 128 \
+  --transform_mode resize_pad \
+  --subdatasets prepare_dataset_train_ratio10p \
+  wm811k /path/to/wm811k
 ```
 
-Note that `sample_runs.sh` contains exemplary training runs to achieve strong AD performance. Due to
-repository changes (& hardware differences), results may deviate slightly from those reported in the
-paper, but should generally be very close or even better. As mentioned previously, for re-use and
-replicability we have also provided several pretrained PatchCore models hosted at __add link__ -
-download the folder, extract, and pass the model of your choice to
-`bin/load_and_evaluate_patchcore.py` which showcases an exemplary evaluation process.
+Randomly initialized CBAM and FCA are archived in the main runner. Use `--cbam_checkpoint` together with `--use_geometry` if CBAM is needed.
 
-During (after) training, the following information will be stored:
+---
 
-```shell
-|PatchCore model (if --save_patchcore_model is set)
-|-- models
-|-----|----- mvtec_bottle
-|-----|-----------|------- nnscorer_search_index.faiss
-|-----|-----------|------- patchcore_params.pkl
-|-----|----- mvtec_cable
-|-----|----- ...
-|-- results.csv # Contains performance for each subdataset.
+## Synthetic-mask localization evaluation
 
-|Sample_segmentations (if --save_segmentation_images is set)
+Pixel-level labels are often unavailable for real wafer maps. This repository therefore supports a controlled localization evaluation set built from paired synthetic images and masks.
+
+The synthetic dataset should follow this structure:
+
+```text
+synthetic_root/
+  images/
+    train/
+      good/
+    val/
+      Center/
+      Donut/
+      Edge-Loc/
+      ...
+  masks/
+    train/
+      good/
+    val/
+      Center/
+      Donut/
+      Edge-Loc/
+      ...
 ```
 
-In addition to the main training process, we have also included Weights-&-Biases logging, which
-allows you to log all training & test performances online to Weights-and-Biases servers
-(<https://wandb.ai>). To use that, include the `--log_online` flag and provide your W&B key in
-`run_patchcore.py > --log_wandb_key`.
+Image and mask stems must match. A mask may also use the `_mask` suffix.
 
-Finally, due to the effectiveness and efficiency of PatchCore, we also incorporate the option to use
-an ensemble of backbone networks and network featuremaps. For this, provide the list of backbones to
-use (as listed in `/src/anomaly_detection/backbones.py`) with `-b <backbone` and, given their
-ordering, denote the layers to extract with `-le idx.<layer_name>`. An example with three different
-backbones would look something like
+Use the synthetic mask set only as a controlled localization benchmark. It should not be described as real wafer pixel-level ground truth.
 
-```shell
-python bin/run_patchcore.py --gpu <gpu_id> --seed <seed> --save_patchcore_model --log_group <log_name> --log_online --log_project <log_project> results \
+Example:
 
-patch_core -b wideresnet101 -b resnext101 -b densenet201 -le 0.layer2 -le 0.layer3 -le 1.layer2 -le 1.layer3 -le 2.features.denseblock2 -le 2.features.denseblock3 --faiss_on_gpu \
-
---pretrain_embed_dimension 1024  --target_embed_dimension 384 --anomaly_scorer_num_nn 1 --patchsize 3 sampler -p 0.01 approx_greedy_coreset dataset --resize 256 --imagesize 224 "${dataset_flags[@]}" mvtec $datapath
-
+```bash
+PYTHONPATH=src python bin/run_patchcore.py \
+  --gpu 0 --seed 0 --save_image_scores \
+  --log_group wm811k_geometry_synth_pixel_eval --log_project wm811k results \
+  patch_core \
+  -b wideresnet50 -le layer2 -le layer3 \
+  --pretrain_embed_dimension 1024 \
+  --target_embed_dimension 1024 \
+  --anomaly_scorer_num_nn 1 \
+  --patchsize 3 \
+  --use_geometry \
+  sampler -p 0.1 --seed 0 geometry_coreset \
+  dataset \
+  --resize 128 --imagesize 128 \
+  --transform_mode resize_pad \
+  --synthetic_pixel_eval_path /path/to/synthetic_root \
+  --synthetic_pixel_eval_subdataset all \
+  --subdatasets prepare_dataset_train_ratio10p \
+  wm811k /path/to/wm811k
 ```
 
-When using `--save_patchcore_model`, in the case of ensembles, a respective ensemble of PatchCore parameters is stored.
+---
 
-### Evaluating a pretrained PatchCore model
+## Filtering and preprocessing
 
-To evaluate a/our pretrained PatchCore model(s), run
+The WM811K loader applies a constrained mean filter by default. It can be controlled with:
 
-```shell
-python bin/load_and_evaluate_patchcore.py --gpu <gpu_id> --seed <seed> $savefolder \
-patch_core_loader "${model_flags[@]}" --faiss_on_gpu \
-dataset --resize 366 --imagesize 320 "${dataset_flags[@]}" mvtec $datapath
+```bash
+--filter_window_size 3 --filter_threshold 1.25
 ```
 
-assuming your pretrained model locations to be contained in `model_flags`; one for each subdataset
-in `dataset_flags`. Results will then be stored in `savefolder`. Example model & dataset flags:
+To disable the filter:
 
-```shell
-model_flags=('-p', 'path_to_mvtec_bottle_patchcore_model', '-p', 'path_to_mvtec_cable_patchcore_model', ...)
-dataset_flags=('-d', 'bottle', '-d', 'cable', ...)
+```bash
+--no-apply_filter
 ```
 
-### Expected performance of pretrained models
+The default wafer transform mode is `resize_pad`, which preserves wafer content and avoids center-crop loss. Other available modes are `resize_only` and `resize_crop`.
 
-While there may be minor changes in performance due to software & hardware differences, the provided
-pretrained models should achieve the performances provided in their respective `results.csv`-files.
-The mean performance (particularly for the baseline WR50 as well as the larger Ensemble model)
-should look something like:
+---
 
-| Model | Mean AUROC | Mean Seg. AUROC | Mean PRO
-|---|---|---|---|
-| WR50-baseline | 99.2% | 98.1% | 94.4%
-| Ensemble | __99.6%__ | __98.2%__ | __94.9%__
+## Outputs
 
-### Citing
+Each run stores the main metrics in the run folder. Depending on the flags, the run may also save:
 
-If you use the code in this repository, please cite
-
+```text
+results/
+  <project>/
+    <group>_<run_id>/
+      results.csv
+      image_scores_<dataset>.csv
+      per_category_metrics_<dataset>.csv
+      models/
+        <dataset>/
+          patchcore_params.pkl
+          nnscorer_search_index.faiss
+          geometry_memory.pkl
 ```
+
+For geometry-aware runs, `geometry_memory.pkl` stores the sampled memory-bank features and their polar-bin metadata.
+
+---
+
+## Recommended ablations
+
+For a paper experiment, evaluate the following components under fixed data splits and at least three random seeds:
+
+1. original PatchCore;
+2. foreground-aware wafer masking;
+3. geometry-balanced coreset sampling;
+4. neighboring-bin nearest-neighbor matching;
+5. mask-pretrained CBAM;
+6. embedding adapter;
+7. complete geometry-aware method.
+
+Report image-level AUROC on real WM811K labels. Report pixel-level AUROC only on real masks when real masks are available. If the masks are generated or synthetic, report them as controlled synthetic-mask localization results.
+
+---
+
+## Archived components
+
+The following components are kept only for historical reference and are not part of the current main method:
+
+- anomaly classification after detection;
+- Frequency and Channel Attention through `--use_fca`;
+- randomly initialized CBAM through `--use_cbam`.
+
+The current main runner will reject archived paths that are no longer supported.
+
+---
+
+## Citation
+
+This repository is adapted from PatchCore. If you use the original PatchCore implementation, please cite:
+
+```bibtex
 @misc{roth2021total,
-      title={Towards Total Recall in Industrial Anomaly Detection},
-      author={Karsten Roth and Latha Pemula and Joaquin Zepeda and Bernhard Schölkopf and Thomas Brox and Peter Gehler},
-      year={2021},
-      eprint={2106.08265},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV}
+  title={Towards Total Recall in Industrial Anomaly Detection},
+  author={Karsten Roth and Latha Pemula and Joaquin Zepeda and Bernhard Schölkopf and Thomas Brox and Peter Gehler},
+  year={2021},
+  eprint={2106.08265},
+  archivePrefix={arXiv},
+  primaryClass={cs.CV}
 }
 ```
-
-## Security
-
-See [CONTRIBUTING](CONTRIBUTING.md#security-issue-notifications) for more information.
 
 ## License
 
