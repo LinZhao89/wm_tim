@@ -32,7 +32,8 @@ def pro_auc(scores, masks, steps=50):
         return 0.0
     values.sort()
     x, y = np.asarray(values).T
-    return float(np.trapezoid(y, x) / 0.3)
+    integrate = getattr(np, "trapezoid", np.trapz)
+    return float(integrate(y, x) / 0.3)
 
 
 @click.command()
@@ -48,6 +49,12 @@ def pro_auc(scores, masks, steps=50):
 @click.option("--gpu", default=0, show_default=True)
 @click.option("--max_train_batches", default=None, type=int)
 @click.option("--max_val_batches", default=None, type=int)
+@click.option("--mse_patience", default=8, show_default=True,
+              help="Stop after this many epochs without meaningful validation MSE improvement.")
+@click.option("--mse_min_delta", default=1e-5, show_default=True,
+              help="Minimum validation MSE improvement considered meaningful.")
+@click.option("--min_epochs", default=10, show_default=True,
+              help="Minimum epochs before MSE early stopping can trigger.")
 @click.option(
     "--transform_mode",
     type=click.Choice(["resize_pad", "resize_only", "resize_crop"]),
@@ -56,7 +63,7 @@ def pro_auc(scores, masks, steps=50):
 )
 def main(synthetic_root, save_path, backbone_name, layers, resize, imagesize,
          epochs, batch_size, learning_rate, gpu, max_train_batches,
-         max_val_batches, transform_mode):
+         max_val_batches, mse_patience, mse_min_delta, min_epochs, transform_mode):
     Path(save_path).parent.mkdir(parents=True, exist_ok=True)
     device = torch.device(f"cuda:{gpu}" if torch.cuda.is_available() else "cpu")
     backbone = patchcore.backbones.load(backbone_name).to(device).eval()
@@ -78,6 +85,8 @@ def main(synthetic_root, save_path, backbone_name, layers, resize, imagesize,
             batch_size=batch_size, shuffle=split == "train")
         for split in ("train", "val")}
     best = -1.0
+    best_mse = float("inf")
+    stale_mse_epochs = 0
     for epoch in range(epochs):
         modules.train()
         for batch_index, batch in enumerate(loaders["train"]):
@@ -103,6 +112,7 @@ def main(synthetic_root, save_path, backbone_name, layers, resize, imagesize,
             optimizer.step()
         modules.eval()
         score_batches, mask_batches = [], []
+        mse_values = []
         with torch.no_grad():
             for batch_index, batch in enumerate(loaders["val"]):
                 if max_val_batches is not None and batch_index >= max_val_batches:
@@ -113,6 +123,15 @@ def main(synthetic_root, save_path, backbone_name, layers, resize, imagesize,
                 layer_scores = []
                 for index, layer in enumerate(layers):
                     logits = heads[index](modules[index](features[layer]))
+                    target = F.interpolate(
+                        torch.from_numpy(masks.astype(np.float32)).to(device).unsqueeze(1)
+                        if masks.ndim == 3 else batch["mask"].to(device),
+                        size=logits.shape[-2:],
+                        mode="nearest",
+                    )
+                    mse_values.append(
+                        F.mse_loss(torch.sigmoid(logits), target).detach().cpu().item()
+                    )
                     layer_scores.append(F.interpolate(
                         torch.sigmoid(logits), size=(imagesize, imagesize),
                         mode="bilinear", align_corners=False))
@@ -121,7 +140,8 @@ def main(synthetic_root, save_path, backbone_name, layers, resize, imagesize,
                 mask_batches.append(masks[:, 0])
         metric = pro_auc(
             np.concatenate(score_batches), np.concatenate(mask_batches))
-        click.echo(f"epoch={epoch + 1} val_aupro={metric:.5f}")
+        val_mse = float(np.mean(mse_values)) if mse_values else float("inf")
+        click.echo(f"epoch={epoch + 1} val_aupro={metric:.5f} val_mse={val_mse:.8f}")
         if metric > best:
             best = metric
             torch.save({
@@ -135,7 +155,20 @@ def main(synthetic_root, save_path, backbone_name, layers, resize, imagesize,
                 "spatial_kernel": 7,
                 "state_dict": modules.state_dict(),
                 "validation_aupro": metric,
+                "validation_mse": val_mse,
             }, save_path)
+        if val_mse < best_mse - mse_min_delta:
+            best_mse = val_mse
+            stale_mse_epochs = 0
+        else:
+            stale_mse_epochs += 1
+        if epoch + 1 >= min_epochs and stale_mse_epochs >= mse_patience:
+            click.echo(
+                "early_stop=val_mse_stable "
+                f"epoch={epoch + 1} best_val_mse={best_mse:.8f} "
+                f"patience={mse_patience} min_delta={mse_min_delta}"
+            )
+            break
 
 
 if __name__ == "__main__":

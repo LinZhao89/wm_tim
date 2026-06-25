@@ -103,6 +103,48 @@ def _compute_classification_metrics(y_true, y_pred, labels):
     }
 
 
+def _safe_image_auroc(scores, labels):
+    labels = np.asarray(labels).astype(int)
+    if len(labels) == 0 or len(np.unique(labels)) < 2:
+        return np.nan
+    return patchcore.metrics.compute_imagewise_retrieval_metrics(scores, labels)["auroc"]
+
+
+def _safe_pixel_auroc_value(preds, truths):
+    has_bg = False
+    has_fg = False
+    for truth in truths:
+        if np.max(truth) > 0:
+            has_fg = True
+        if np.min(truth) == 0:
+            has_bg = True
+        if has_fg and has_bg:
+            break
+    if not (has_fg and has_bg):
+        return np.nan
+    return patchcore.metrics.compute_pixelwise_retrieval_metrics(preds, truths)["auroc"]
+
+
+def _write_per_category_metrics_csv(path, rows):
+    fieldnames = [
+        "category",
+        "image_total",
+        "image_detected",
+        "image_accuracy",
+        "image_auroc_vs_good",
+        "pixel_total",
+        "pixel_anomaly_total",
+        "full_pixel_auroc",
+        "anomaly_pixel_auroc",
+    ]
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
 def _log_classification_metrics(report):
     if not report["total_samples"]:
         LOGGER.info("Classification metrics: no labeled samples available.")
@@ -269,6 +311,7 @@ def run(
 
             torch.cuda.empty_cache()
             aggregator = {"scores": [], "segmentations": []}
+            use_real_pixel_maps = dataloaders.get("pixel_testing") is dataloaders["testing"]
             
             image_names = [x[2] for x in dataloaders["testing"].dataset.data_to_iterate]
 
@@ -280,10 +323,11 @@ def run(
                     )
                 )
                 scores, segmentations, labels_gt, masks_gt = PatchCore.predict(
-                    dataloaders["testing"]
+                    dataloaders["testing"], return_segmentations=use_real_pixel_maps
                 )
                 aggregator["scores"].append(scores)
-                aggregator["segmentations"].append(segmentations)
+                if use_real_pixel_maps:
+                    aggregator["segmentations"].append(segmentations)
              
             #print(f'run patchcore mask_gt: {len(masks_gt)}')
             #print(f'run patchcore label_gt: {len(labels_gt)}')
@@ -325,19 +369,13 @@ def run(
             boundary_score = scores_lst[boundary_idx]
             print("boundary_score:", boundary_score)            
 
-            segmentations = np.array(aggregator["segmentations"])
-            min_scores = (
-                segmentations.reshape(len(segmentations), -1)
-                .min(axis=-1)
-                .reshape(-1, 1, 1, 1)
-            )
-            max_scores = (
-                segmentations.reshape(len(segmentations), -1)
-                .max(axis=-1)
-                .reshape(-1, 1, 1, 1)
-            )
-            segmentations = (segmentations - min_scores) / (max_scores - min_scores)
-            segmentations = np.mean(segmentations, axis=0)
+            if use_real_pixel_maps:
+                segmentations = np.array(aggregator["segmentations"])
+                min_scores = segmentations.reshape(len(segmentations), -1).min(axis=-1).reshape(-1, 1, 1, 1)
+                max_scores = segmentations.reshape(len(segmentations), -1).max(axis=-1).reshape(-1, 1, 1, 1)
+                segmentations = np.mean((segmentations - min_scores) / (max_scores - min_scores), axis=0)
+            else:
+                segmentations, masks_gt = [], []
 
             anomaly_labels = [
                 x[1] != "good" for x in dataloaders["testing"].dataset.data_to_iterate
@@ -411,9 +449,46 @@ def run(
                     
                 return patchcore.metrics.compute_pixelwise_retrieval_metrics(preds, truths)
 
-            pixel_scores = safe_compute_pixel_auroc(segmentations, masks_gt)
-            full_pixel_auroc = pixel_scores["auroc"]
-            
+            full_pixel_auroc = safe_compute_pixel_auroc(segmentations, masks_gt)["auroc"] if use_real_pixel_maps else np.nan
+
+            if dataloaders.get("pixel_testing") is not dataloaders["testing"]:
+                LOGGER.info("Computing pixel metrics on synthetic validation masks.")
+                pixel_aggregator = {"segmentations": []}
+                pixel_masks_gt = []
+                for i, PatchCore in enumerate(PatchCore_list):
+                    torch.cuda.empty_cache()
+                    LOGGER.info(
+                        "Embedding synthetic pixel-eval data with models ({}/{})".format(
+                            i + 1, len(PatchCore_list)
+                        )
+                    )
+                    _, pixel_segmentations, _, pixel_masks_gt = PatchCore.predict(
+                        dataloaders["pixel_testing"]
+                    )
+                    pixel_aggregator["segmentations"].append(pixel_segmentations)
+                pixel_segmentations = np.array(pixel_aggregator["segmentations"])
+                min_scores = (
+                    pixel_segmentations.reshape(len(pixel_segmentations), -1)
+                    .min(axis=-1)
+                    .reshape(-1, 1, 1, 1)
+                )
+                max_scores = (
+                    pixel_segmentations.reshape(len(pixel_segmentations), -1)
+                    .max(axis=-1)
+                    .reshape(-1, 1, 1, 1)
+                )
+                denom = np.maximum(max_scores - min_scores, 1e-12)
+                pixel_segmentations = (pixel_segmentations - min_scores) / denom
+                segmentations_for_pixel = np.mean(pixel_segmentations, axis=0)
+                masks_gt_for_pixel = pixel_masks_gt
+                pixel_scores = safe_compute_pixel_auroc(
+                    segmentations_for_pixel, masks_gt_for_pixel
+                )
+                full_pixel_auroc = pixel_scores["auroc"]
+            else:
+                segmentations_for_pixel = segmentations
+                masks_gt_for_pixel = masks_gt
+
             # add in visualization to output images 
             # Save anomaly_segmentations
             #anomaly_img = Image.fromarray(segmentations)
@@ -428,18 +503,87 @@ def run(
 
             # Compute PRO score & PW Auroc only images with anomalies
             sel_idxs = []
-            for i in range(len(masks_gt)):
-                if np.sum(masks_gt[i]) > 0:
+            for i in range(len(masks_gt_for_pixel)):
+                if np.sum(masks_gt_for_pixel[i]) > 0:
                     sel_idxs.append(i)
             
             if len(sel_idxs) > 0:
                 pixel_scores = safe_compute_pixel_auroc(
-                    [segmentations[i] for i in sel_idxs],
-                    [masks_gt[i] for i in sel_idxs],
+                    [segmentations_for_pixel[i] for i in sel_idxs],
+                    [masks_gt_for_pixel[i] for i in sel_idxs],
                 )
                 anomaly_pixel_auroc = pixel_scores["auroc"]
             else:
                 anomaly_pixel_auroc = 0.5
+
+            image_categories = [x[1] for x in dataloaders["testing"].dataset.data_to_iterate]
+            image_pred_anomaly = np.asarray(scores_mean) >= boundary_score
+            per_category_rows = []
+            image_category_names = sorted(set(image_categories))
+            pixel_category_names = []
+            if hasattr(dataloaders["pixel_testing"].dataset, "data_to_iterate"):
+                pixel_category_names = sorted(
+                    set(x[1] for x in dataloaders["pixel_testing"].dataset.data_to_iterate)
+                )
+            all_category_names = sorted(set(image_category_names) | set(pixel_category_names))
+            good_indices = [i for i, category in enumerate(image_categories) if category == "good"]
+
+            for category in all_category_names:
+                image_indices = [
+                    i for i, image_category in enumerate(image_categories)
+                    if image_category == category
+                ]
+                if category == "good":
+                    image_detected = int(np.sum(~image_pred_anomaly[image_indices])) if image_indices else 0
+                else:
+                    image_detected = int(np.sum(image_pred_anomaly[image_indices])) if image_indices else 0
+                image_total = len(image_indices)
+                image_accuracy = image_detected / image_total if image_total else np.nan
+
+                image_auroc = np.nan
+                if category != "good" and image_indices and good_indices:
+                    auroc_indices = good_indices + image_indices
+                    auroc_scores = np.asarray(scores_mean)[auroc_indices]
+                    auroc_labels = [0] * len(good_indices) + [1] * len(image_indices)
+                    image_auroc = _safe_image_auroc(auroc_scores, auroc_labels)
+
+                pixel_indices = []
+                if hasattr(dataloaders["pixel_testing"].dataset, "data_to_iterate"):
+                    pixel_indices = [
+                        i for i, sample in enumerate(dataloaders["pixel_testing"].dataset.data_to_iterate)
+                        if sample[1] == category
+                    ]
+                pixel_anomaly_indices = [
+                    i for i in pixel_indices if np.sum(masks_gt_for_pixel[i]) > 0
+                ]
+                category_full_pixel_auroc = (
+                    _safe_pixel_auroc_value(
+                        [segmentations_for_pixel[i] for i in pixel_indices],
+                        [masks_gt_for_pixel[i] for i in pixel_indices],
+                    )
+                    if pixel_indices else np.nan
+                )
+                category_anomaly_pixel_auroc = (
+                    _safe_pixel_auroc_value(
+                        [segmentations_for_pixel[i] for i in pixel_anomaly_indices],
+                        [masks_gt_for_pixel[i] for i in pixel_anomaly_indices],
+                    )
+                    if pixel_anomaly_indices else np.nan
+                )
+
+                per_category_rows.append(
+                    {
+                        "category": category,
+                        "image_total": image_total,
+                        "image_detected": image_detected,
+                        "image_accuracy": image_accuracy,
+                        "image_auroc_vs_good": image_auroc,
+                        "pixel_total": len(pixel_indices),
+                        "pixel_anomaly_total": len(pixel_anomaly_indices),
+                        "full_pixel_auroc": category_full_pixel_auroc,
+                        "anomaly_pixel_auroc": category_anomaly_pixel_auroc,
+                    }
+                )
 
             result_collect.append(
                 {
@@ -476,6 +620,12 @@ def run(
                     out_path = os.path.join(run_save_path, f"image_scores_{dataset_name}.csv")
                 os.makedirs(os.path.dirname(out_path) or run_save_path, exist_ok=True)
                 image_score_df.to_csv(out_path, index=False)
+
+            per_category_metrics_path = os.path.join(
+                run_save_path, f"per_category_metrics_{dataset_name}.csv"
+            )
+            _write_per_category_metrics_csv(per_category_metrics_path, per_category_rows)
+            LOGGER.info("Per-category metrics saved to: %s", per_category_metrics_path)
 
             # Optionally run anomaly classification using trained classifier
             if classify_anomalies:
@@ -872,6 +1022,7 @@ def sampler(name, percentage, seed, num_starting_points):
 @click.argument("data_path", type=click.Path(exists=True, file_okay=False))
 @click.option("--subdatasets", "-d", multiple=True, type=str, required=True)
 @click.option("--train_val_split", type=float, default=1, show_default=True)
+@click.option("--train_sample_limit", type=int, default=0, show_default=True, help="Optional fixed-size random subset of normal training images; 0 uses all.")
 @click.option("--batch_size", default=2, type=int, show_default=True)
 @click.option("--num_workers", default=8, type=int, show_default=True)
 @click.option("--resize", default=256, type=int, show_default=True)
@@ -880,17 +1031,37 @@ def sampler(name, percentage, seed, num_starting_points):
 @click.option("--filter_window_size", type=int, default=3, show_default=True, help="Window size for constrained mean filter (wm811k dataset).")
 @click.option("--filter_threshold", type=float, default=1.25, show_default=True, help="Threshold for constrained mean filter (wm811k dataset).")
 @click.option(
+    "--apply_filter/--no-apply_filter",
+    default=True,
+    show_default=True,
+    help="Apply the constrained mean filter to real WM811K train/test images.",
+)
+@click.option(
     "--transform_mode",
     type=click.Choice(["resize_pad", "resize_only", "resize_crop"]),
     default="resize_pad",
     show_default=True,
     help="Wafer resize policy. resize_pad preserves full wafer content and never crops.",
 )
+@click.option(
+    "--synthetic_pixel_eval_path",
+    type=click.Path(exists=True, file_okay=False),
+    default=None,
+    help="Optional synthetic image/mask root used only for pixel-level AUROC.",
+)
+@click.option(
+    "--synthetic_pixel_eval_subdataset",
+    type=str,
+    default="all",
+    show_default=True,
+    help="Synthetic validation category for pixel AUROC; use all for every category.",
+)
 def dataset(
     name,
     data_path,
     subdatasets,
     train_val_split,
+    train_sample_limit,
     batch_size,
     resize,
     imagesize,
@@ -898,10 +1069,19 @@ def dataset(
     augment,
     filter_window_size,
     filter_threshold,
+    apply_filter,
     transform_mode,
+    synthetic_pixel_eval_path,
+    synthetic_pixel_eval_subdataset,
 ):
     dataset_info = _DATASETS[name]
     dataset_library = __import__(dataset_info[0], fromlist=[dataset_info[1]])
+    synthetic_dataset_library = None
+    if synthetic_pixel_eval_path:
+        synthetic_dataset_library = __import__(
+            "patchcore.datasets.synthetic_masks",
+            fromlist=["SyntheticMaskPatchCoreDataset", "DatasetSplit"],
+        )
 
     def get_dataloaders(seed):
         dataloaders = []
@@ -915,10 +1095,17 @@ def dataset(
                 split=dataset_library.DatasetSplit.TRAIN,
                 seed=seed,
                 augment=augment,
+                apply_filter=apply_filter,
                 filter_window_size=filter_window_size,
                 filter_threshold=filter_threshold,
                 transform_mode=transform_mode,
             )
+            if train_sample_limit:
+                limit = min(train_sample_limit, len(train_dataset))
+                generator = torch.Generator().manual_seed(0 if seed is None else seed)
+                indices = torch.randperm(len(train_dataset), generator=generator)[:limit].tolist()
+                train_dataset = torch.utils.data.Subset(train_dataset, indices)
+                train_dataset.imagesize = train_dataset.dataset.imagesize
 
             test_dataset = dataset_library.__dict__[dataset_info[1]](
                 data_path,
@@ -927,6 +1114,7 @@ def dataset(
                 imagesize=imagesize,
                 split=dataset_library.DatasetSplit.TEST,
                 seed=seed,
+                apply_filter=apply_filter,
                 filter_window_size=filter_window_size,
                 filter_threshold=filter_threshold,
                 transform_mode=transform_mode,
@@ -948,6 +1136,28 @@ def dataset(
                 pin_memory=True,
             )
 
+            if synthetic_dataset_library is not None:
+                pixel_dataset = synthetic_dataset_library.SyntheticMaskPatchCoreDataset(
+                    synthetic_pixel_eval_path,
+                    classname=synthetic_pixel_eval_subdataset,
+                    resize=resize,
+                    imagesize=imagesize,
+                    split=synthetic_dataset_library.DatasetSplit.TEST,
+                    transform_mode=transform_mode,
+                    apply_filter=apply_filter,
+                    filter_window_size=filter_window_size,
+                    filter_threshold=filter_threshold,
+                )
+                pixel_dataloader = torch.utils.data.DataLoader(
+                    pixel_dataset,
+                    batch_size=batch_size,
+                    shuffle=False,
+                    num_workers=num_workers,
+                    pin_memory=True,
+                )
+            else:
+                pixel_dataloader = test_dataloader
+
             train_dataloader.name = name
             if subdataset is not None:
                 train_dataloader.name += "_" + subdataset
@@ -961,6 +1171,7 @@ def dataset(
                     imagesize=imagesize,
                     split=dataset_library.DatasetSplit.VAL,
                     seed=seed,
+                    apply_filter=apply_filter,
                     filter_window_size=filter_window_size,
                     filter_threshold=filter_threshold,
                     transform_mode=transform_mode,
@@ -979,6 +1190,7 @@ def dataset(
                 "training": train_dataloader,
                 "validation": val_dataloader,
                 "testing": test_dataloader,
+                "pixel_testing": pixel_dataloader,
             }
 
             dataloaders.append(dataloader_dict)
