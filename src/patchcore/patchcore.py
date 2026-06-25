@@ -262,12 +262,12 @@ class PatchCore(torch.nn.Module):
 
         self.anomaly_scorer.fit(detection_features=[features])
 
-    def predict(self, data):
+    def predict(self, data, return_segmentations=True):
         if isinstance(data, torch.utils.data.DataLoader):
-            return self._predict_dataloader(data)
-        return self._predict(data)
+            return self._predict_dataloader(data, return_segmentations)
+        return self._predict(data, return_segmentations)
 
-    def _predict_dataloader(self, dataloader):
+    def _predict_dataloader(self, dataloader, return_segmentations=True):
         """This function provides anomaly scores/maps for full dataloaders."""
         _ = self.forward_modules.eval()
 
@@ -279,15 +279,16 @@ class PatchCore(torch.nn.Module):
             for image in data_iterator:
                 if isinstance(image, dict):
                     labels_gt.extend(image["is_anomaly"].numpy().tolist())
-                    masks_gt.extend(image["mask"].numpy().tolist())
+                    if return_segmentations:
+                        masks_gt.extend(image["mask"].numpy().tolist())
                     image = image["image"]
-                _scores, _masks = self._predict(image)
-                for score, mask in zip(_scores, _masks):
-                    scores.append(score)
-                    masks.append(mask)
+                _scores, _masks = self._predict(image, return_segmentations)
+                scores.extend(_scores)
+                if return_segmentations:
+                    masks.extend(_masks)
         return scores, masks, labels_gt, masks_gt
 
-    def _predict(self, images):
+    def _predict(self, images, return_segmentations=True):
         """Infer score and mask for a batch of images."""
         images = images.to(torch.float).to(self.device)
         _ = self.forward_modules.eval()
@@ -303,6 +304,8 @@ class PatchCore(torch.nn.Module):
             )
             image_scores = image_scores.reshape(*image_scores.shape[:2], -1)
             image_scores = self.patch_maker.score(image_scores)
+            if not return_segmentations:
+                return [score for score in image_scores], []
 
             patch_scores = self.patch_maker.unpatch_scores(
                 patch_scores, batchsize=batchsize

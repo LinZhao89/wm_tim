@@ -156,20 +156,22 @@ class PatchCore(torch.nn.Module):
             np.concatenate(bin_sets).astype(np.int64))
         self.anomaly_scorer.fit(features, bins)
 
-    def predict(self, data):
+    def predict(self, data, return_segmentations=True):
         if not isinstance(data, torch.utils.data.DataLoader):
             return self._predict(data)
         scores, masks, labels, ground_truth = [], [], [], []
         for batch in tqdm.tqdm(data, desc="Inferring...", leave=False):
             labels.extend(batch["is_anomaly"].numpy().tolist())
-            ground_truth.extend(batch["mask"].numpy().tolist())
+            if return_segmentations:
+                ground_truth.extend(batch["mask"].numpy().tolist())
             batch_scores, batch_masks = self._predict(
-                batch["image"], batch.get("raw_image", batch["image"]))
+                batch["image"], batch.get("raw_image", batch["image"]), return_segmentations)
             scores.extend(batch_scores)
-            masks.extend(batch_masks)
+            if return_segmentations:
+                masks.extend(batch_masks)
         return scores, masks, labels, ground_truth
 
-    def _predict(self, images, raw_images=None):
+    def _predict(self, images, raw_images=None, return_segmentations=True):
         images = images.float().to(self.device)
         raw = images if raw_images is None else raw_images.float().to(self.device)
         features, shapes, geometry = self._embed(
@@ -179,6 +181,8 @@ class PatchCore(torch.nn.Module):
             geometry["valid"].reshape(-1))
         scores = scores.reshape(len(images), -1)
         image_scores = scores.max(axis=1)
+        if not return_segmentations:
+            return list(image_scores), []
         grid = shapes[0]
         masks = self.anomaly_segmentor.convert_to_segmentation(
             scores.reshape(len(images), grid[0], grid[1]))

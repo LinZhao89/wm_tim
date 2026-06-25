@@ -3,6 +3,7 @@
 from enum import Enum
 from pathlib import Path
 
+import numpy as np
 import torch
 from PIL import Image
 from torch.utils.data import Dataset
@@ -12,6 +13,7 @@ from patchcore.datasets.wafer_transforms import (
     DEFAULT_WAFER_BACKGROUND,
     transform_wafer,
 )
+from patchcore.datasets.wm811k import WM811K_MEAN, WM811K_STD, wm811kDataset
 
 
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff"}
@@ -28,6 +30,27 @@ def _normalized_stem(path: Path) -> str:
     return stem[:-5] if stem.lower().endswith("_mask") else stem
 
 
+def _filter_image_and_mask(image, mask, filter_window_size, filter_threshold):
+    """Apply WM811K noise filtering to an image and remove matching mask pixels."""
+    gray_img_arr = np.array(image.convert("L"))
+    class_map = np.ones_like(gray_img_arr, dtype=np.float32)
+    class_map[gray_img_arr > 200] = 2
+    class_map[(gray_img_arr > 100) & (gray_img_arr <= 200)] = 0.5
+    class_map[gray_img_arr <= 100] = 0
+
+    from scipy.ndimage import uniform_filter
+
+    mean_map = uniform_filter(class_map, size=filter_window_size, mode="constant")
+    removed_anomaly_pixels = (class_map == 2) & (mean_map < filter_threshold)
+
+    filtered_image = wm811kDataset.constrained_mean_filter(
+        image, filter_window_size, filter_threshold)
+    mask_arr = np.array(mask.convert("L"))
+    mask_arr[removed_anomaly_pixels] = 0
+    filtered_mask = Image.fromarray(mask_arr, mode="L")
+    return filtered_image, filtered_mask
+
+
 class SyntheticMaskDataset(Dataset):
     def __init__(
         self,
@@ -38,6 +61,9 @@ class SyntheticMaskDataset(Dataset):
         allow_empty_masks=False,
         transform_mode="resize_pad",
         pad_color=DEFAULT_WAFER_BACKGROUND,
+        apply_filter=True,
+        filter_window_size=3,
+        filter_threshold=1.25,
     ):
         self.root = Path(root)
         self.resize = resize
@@ -45,6 +71,9 @@ class SyntheticMaskDataset(Dataset):
         self.allow_empty_masks = allow_empty_masks
         self.transform_mode = transform_mode
         self.pad_color = tuple(pad_color)
+        self.apply_filter = apply_filter
+        self.filter_window_size = filter_window_size
+        self.filter_threshold = filter_threshold
         image_root = self.root / "images" / split
         mask_root = self.root / "masks" / split
         if not image_root.is_dir() or not mask_root.is_dir():
@@ -88,9 +117,12 @@ class SyntheticMaskDataset(Dataset):
         image_path, mask_path = self.samples[index]
         image = Image.open(image_path).convert("RGB")
         mask = Image.open(mask_path).convert("L")
+        if self.apply_filter:
+            image, mask = _filter_image_and_mask(
+                image, mask, self.filter_window_size, self.filter_threshold)
         raw_image = TF.to_tensor(self._transform(image, TF.InterpolationMode.BILINEAR))
         mask = TF.to_tensor(self._transform(mask, TF.InterpolationMode.NEAREST)) > 0.5
-        image = TF.normalize(raw_image, [0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        image = TF.normalize(raw_image, WM811K_MEAN, WM811K_STD)
         return {"image": image, "raw_image": raw_image, "mask": mask.float(), "image_path": str(image_path)}
 
 
@@ -110,6 +142,9 @@ class SyntheticMaskPatchCoreDataset(Dataset):
         split=DatasetSplit.TRAIN,
         transform_mode="resize_pad",
         pad_color=DEFAULT_WAFER_BACKGROUND,
+        apply_filter=True,
+        filter_window_size=3,
+        filter_threshold=1.25,
         **kwargs,
     ):
         self.source = Path(source)
@@ -120,6 +155,9 @@ class SyntheticMaskPatchCoreDataset(Dataset):
         self.split = split
         self.transform_mode = transform_mode
         self.pad_color = tuple(pad_color)
+        self.apply_filter = apply_filter
+        self.filter_window_size = filter_window_size
+        self.filter_threshold = filter_threshold
         self.samples = self._collect_samples()
         if not self.samples:
             raise ValueError(f"No synthetic samples found for split={split} class={classname}")
@@ -175,8 +213,11 @@ class SyntheticMaskPatchCoreDataset(Dataset):
         category, image_path, mask_path = self.samples[index]
         image = Image.open(image_path).convert("RGB")
         mask = Image.open(mask_path).convert("L")
+        if self.apply_filter:
+            image, mask = _filter_image_and_mask(
+                image, mask, self.filter_window_size, self.filter_threshold)
         raw_image = TF.to_tensor(self._transform(image, TF.InterpolationMode.BILINEAR))
-        image = TF.normalize(raw_image, [0.485, 0.456, 0.406], [0.229, 0.224, 0.225])
+        image = TF.normalize(raw_image, WM811K_MEAN, WM811K_STD)
         mask = (TF.to_tensor(self._transform(mask, TF.InterpolationMode.NEAREST)) > 0.5).float()
         return {
             "image": image,

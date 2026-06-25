@@ -337,11 +337,7 @@ class wm811kDataset(torch.utils.data.Dataset):
                             stem = os.path.splitext(mask_name)[0]
                             while stem.lower().endswith("_mask"):
                                 stem = stem[:-5]
-                            if stem in mask_by_stem:
-                                raise ValueError(
-                                    f"Duplicate masks for {stem} in {anomaly_mask_path}"
-                                )
-                            mask_by_stem[stem] = mask_name
+                            mask_by_stem.setdefault(stem, []).append(mask_name)
                         
                         for img_p in imgpaths_per_class[classname][anomaly]:
                             img_name = os.path.basename(img_p)
@@ -355,7 +351,9 @@ class wm811kDataset(torch.utils.data.Dataset):
                             
                             # Try exact match
                             image_stem = os.path.splitext(img_name)[0]
-                            mask_name = mask_by_stem.get(image_stem)
+                            mask_name = self._select_mask_name(
+                                image_stem, mask_by_stem.get(image_stem, [])
+                            )
                             full_mask_paths.append(
                                 os.path.join(anomaly_mask_path, mask_name)
                                 if mask_name else None
@@ -394,3 +392,13 @@ class wm811kDataset(torch.utils.data.Dataset):
         #print(data_to_iterate)
         #print('*********')
         return imgpaths_per_class, data_to_iterate
+
+    @staticmethod
+    def _select_mask_name(image_stem, candidates):
+        if not candidates:
+            return None
+        by_name = {name.lower(): name for name in candidates}
+        for preferred in (f"{image_stem}_mask.png", f"{image_stem}.png"):
+            if preferred.lower() in by_name:
+                return by_name[preferred.lower()]
+        return sorted(candidates, key=lambda name: (name.lower().count("_mask"), name))[0]
