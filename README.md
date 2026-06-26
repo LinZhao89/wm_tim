@@ -1,7 +1,6 @@
 # Geometry-Aware Wafer Map Anomaly Detection
 
-This repository is adapted from PatchCore for wafer map anomaly detection and localization.
-The current codebase focuses on **detection and localization only**. The archived anomaly classification path, Frequency and Channel Attention (FCA), and randomly initialized CBAM execution are not part of the current main experiment path.
+This repository is adapted from PatchCore for wafer map anomaly detection and localization. The current codebase focuses on **detection and localization only**. The archived anomaly classification path, Frequency and Channel Attention (FCA), and randomly initialized CBAM execution are not part of the current main experiment path.
 
 The main research path is:
 
@@ -32,13 +31,13 @@ On Windows PowerShell:
 $env:PYTHONPATH='src'
 ```
 
-The original experiments were developed with PyTorch, torchvision, FAISS, scikit-image, scikit-learn, scipy, pillow, tqdm, and click. See `requirements.txt` for the package list.
+Use `bin/run_patchcore_compat.py` for current wafer experiments. This compatibility launcher maps the public CLI flag `--anomaly_scorer_num_nn` to the internal model argument `anomaly_score_num_nn`, so the nearest-neighbor setting is not silently ignored by older model classes.
 
 ---
 
 ## Expected WM811K layout
 
-The WM811K data should be prepared into an MVTec-like folder layout. A typical layout is:
+The WM811K data should be prepared into an MVTec-like folder layout:
 
 ```text
 wm811k/
@@ -79,10 +78,8 @@ When using the command-line interface, the dataset root is passed as `/path/to/w
 
 ## Baseline PatchCore run
 
-The following command runs the original PatchCore baseline on the prepared WM811K split:
-
 ```bash
-PYTHONPATH=src python bin/run_patchcore.py \
+PYTHONPATH=src python bin/run_patchcore_compat.py \
   --gpu 0 --seed 0 --save_patchcore_model --save_image_scores \
   --log_group wm811k_patchcore_baseline --log_project wm811k results \
   patch_core \
@@ -107,7 +104,7 @@ The command saves image-level scores when `--save_image_scores` is enabled. By d
 The geometry-aware path adds wafer foreground estimation, polar patch bins, geometry-balanced memory-bank sampling, and neighboring-bin nearest-neighbor search.
 
 ```bash
-PYTHONPATH=src python bin/run_patchcore.py \
+PYTHONPATH=src python bin/run_patchcore_compat.py \
   --gpu 0 --seed 0 --save_patchcore_model --save_image_scores \
   --log_group wm811k_geometry_patchcore --log_project wm811k results \
   patch_core \
@@ -139,7 +136,7 @@ For geometry-aware PatchCore, use `geometry_coreset`. The geometry path requires
 The geometry-aware path can optionally load a mask-pretrained CBAM checkpoint and an embedding adapter:
 
 ```bash
-PYTHONPATH=src python bin/run_patchcore.py \
+PYTHONPATH=src python bin/run_patchcore_compat.py \
   --gpu 0 --seed 0 --save_patchcore_model --save_image_scores \
   --log_group wm811k_geometry_cbam_adapter --log_project wm811k results \
   patch_core \
@@ -167,8 +164,6 @@ Randomly initialized CBAM and FCA are archived in the main runner. Use `--cbam_c
 
 Pixel-level labels are often unavailable for real wafer maps. This repository therefore supports a controlled localization evaluation set built from paired synthetic images and masks.
 
-The synthetic dataset should follow this structure:
-
 ```text
 synthetic_root/
   images/
@@ -189,14 +184,12 @@ synthetic_root/
       ...
 ```
 
-Image and mask stems must match. A mask may also use the `_mask` suffix.
-
-Use the synthetic mask set only as a controlled localization benchmark. It should not be described as real wafer pixel-level ground truth.
+Image and mask stems must match. A mask may also use the `_mask` suffix. Use the synthetic mask set only as a controlled localization benchmark. It should not be described as real wafer pixel-level ground truth.
 
 Example:
 
 ```bash
-PYTHONPATH=src python bin/run_patchcore.py \
+PYTHONPATH=src python bin/run_patchcore_compat.py \
   --gpu 0 --seed 0 --save_image_scores \
   --log_group wm811k_geometry_synth_pixel_eval --log_project wm811k results \
   patch_core \
